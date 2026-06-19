@@ -1,0 +1,12 @@
+.env
+.vscode
+bin
+obj
+.vs
+.trae
+node_modules
+__pycache__
+logs
+*.log
+_build
+target
