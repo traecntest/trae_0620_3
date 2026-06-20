@@ -35,6 +35,7 @@ class WaveformWidget:
         self.plot.addItem(self._fill)
         self._keyword_lines: list = []
         self._milestone_items: list = []
+        self._playback_cursor = None  # the moving vertical line during playback
         self._sr = config.SAMPLE_RATE
 
     # ------------------------------------------------------------------ #
@@ -95,7 +96,29 @@ class WaveformWidget:
             self.plot.addItem(star)
             self._milestone_items.append(star)
 
+    # ------------------------------------------------------------------ #
+    # playback cursor
+    # ------------------------------------------------------------------ #
+    def set_playback_position(self, t: float) -> None:
+        """Move the playback cursor to time ``t`` seconds (show if not yet visible)."""
+        import pyqtgraph as pg
+
+        if self._playback_cursor is None:
+            self._playback_cursor = pg.InfiniteLine(
+                pos=t, angle=90,
+                pen=pg.mkPen("#ffd60a", width=2),
+                label="",
+            )
+            self.plot.addItem(self._playback_cursor)
+        self._playback_cursor.setPos(t)
+
+    def hide_playback_cursor(self) -> None:
+        if self._playback_cursor is not None:
+            self.plot.removeItem(self._playback_cursor)
+            self._playback_cursor = None
+
     def clear(self) -> None:
+        self.hide_playback_cursor()
         self.set_samples(np.zeros(0, dtype=np.float32))
         self.set_keywords([])
         self.set_milestones([])

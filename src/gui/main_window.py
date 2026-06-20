@@ -14,6 +14,7 @@ runs on a QThread so the UI never stalls.
 from __future__ import annotations
 
 from datetime import datetime
+import threading
 from typing import Optional
 
 import numpy as np
@@ -42,7 +43,7 @@ _EMOTION_ZH = {
 # --------------------------------------------------------------------------- #
 # processing worker
 # --------------------------------------------------------------------------- #
-from PySide6.QtCore import Qt, QThread, Signal, QObject  # noqa: E402
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer  # noqa: E402
 
 
 class ProcessWorker(QObject):
@@ -97,8 +98,8 @@ class ModelDownloadWorker(QObject):
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget, QWidgetAction,
+    QSizePolicy, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 
@@ -213,6 +214,14 @@ class MainWindow(QMainWindow):
         self._refresh_clips()
         self._refresh_milestones()
 
+        # playback state
+        self._play_samples: np.ndarray | None = None
+        self._play_sr: int = config.SAMPLE_RATE
+        self._play_stream = None
+        self._play_pos: int = 0          # frames
+        self._play_lock = threading.Lock()
+        self._play_timer: QTimer | None = None
+
     # ------------------------------------------------------------------ #
     # construction
     # ------------------------------------------------------------------ #
@@ -277,9 +286,41 @@ class MainWindow(QMainWindow):
         llay.addWidget(self.table)
         splitter.addWidget(left)
 
-        # ---- center: waveform + panels ----
+        # ---- center: playback controls + waveform + panels ----
         center = QWidget()
         clay = QVBoxLayout(center)
+
+        # playback controls
+        self.play_bar = QHBoxLayout()
+        self.btn_play = QPushButton("▶ 播放")
+        self.btn_play.clicked.connect(self._play_toggle)
+        self.btn_play.setEnabled(False)
+        self.play_bar.addWidget(self.btn_play)
+
+        self.btn_stop = QPushButton("⏹ 停止")
+        self.btn_stop.clicked.connect(self._play_stop)
+        self.btn_stop.setEnabled(False)
+        self.play_bar.addWidget(self.btn_stop)
+
+        self.lbl_time = QLabel("00:00 / 00:00")
+        self.play_bar.addWidget(self.lbl_time)
+
+        self.play_slider = QSlider(Qt.Horizontal)
+        self.play_slider.setRange(0, 1000)
+        self.play_slider.setValue(0)
+        self.play_slider.setEnabled(False)
+        self.play_slider.sliderMoved.connect(self._play_seek)
+        self.play_bar.addWidget(self.play_slider, 1)
+
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(80)
+        self.vol_slider.setToolTip("音量")
+        self.vol_slider.setFixedWidth(90)
+        self.play_bar.addWidget(self.vol_slider)
+
+        clay.addLayout(self.play_bar)
+
         self.wave = WaveformWidget()
         clay.addWidget(self.wave.widget(), 3)
         self.lbl_emotion = QLabel("情绪: —")
@@ -370,6 +411,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导入失败", str(exc))
             return
         self.wave.set_samples(samples, config.SAMPLE_RATE)
+        self._set_play_samples(samples, config.SAMPLE_RATE)
         self.status.showMessage(f"已导入 {path}，处理中…")
         self._process(samples, tag=config.SAFE_TAG_DEFAULT)
 
@@ -405,8 +447,10 @@ class MainWindow(QMainWindow):
         try:
             samples = load_wav(self.files.resolve(o.clip.audio_path), config.SAMPLE_RATE)
             self.wave.set_samples(samples, config.SAMPLE_RATE)
+            self._set_play_samples(samples, config.SAMPLE_RATE)
         except Exception:
             self.wave.set_samples(np.zeros(0, dtype=np.float32), config.SAMPLE_RATE)
+            self._set_play_samples(None)
         self.wave.set_keywords(o.keywords)
         self.wave.set_milestones([m.timestamp for m in o.milestones])
         f = o.features
@@ -428,6 +472,137 @@ class MainWindow(QMainWindow):
             self.lbl_keywords.setText(f"关键词时间戳: {ks}")
         else:
             self.lbl_keywords.setText("关键词时间戳: (无)")
+
+    # ------------------------------------------------------------------ #
+    # playback controls
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _fmt_t(seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _set_play_samples(self, samples: np.ndarray, sr: int = config.SAMPLE_RATE) -> None:
+        """Set the playback buffer and enable/disable controls accordingly."""
+        self._play_stop()
+        if samples is None or samples.size == 0:
+            self._play_samples = None
+            self._play_sr = sr
+            self.btn_play.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.play_slider.setEnabled(False)
+            self.play_slider.setValue(0)
+            self.lbl_time.setText("00:00 / 00:00")
+            return
+        self._play_samples = np.ascontiguousarray(samples, dtype=np.float32)
+        self._play_sr = sr
+        self._play_pos = 0
+        self.btn_play.setEnabled(True)
+        self.btn_play.setText("▶ 播放")
+        self.btn_stop.setEnabled(False)
+        self.play_slider.setEnabled(True)
+        self.play_slider.setRange(0, max(1, int(self._play_samples.size / self._play_sr * 1000)))
+        self.play_slider.setValue(0)
+        self.lbl_time.setText(f"00:00 / {self._fmt_t(self._play_samples.size / self._play_sr)}")
+
+    def _play_toggle(self) -> None:
+        if self._play_samples is None:
+            return
+        if self._play_stream is not None and self._play_stream.active:
+            self._pause_stream()
+            return
+        # start or resume
+        if self._play_pos >= self._play_samples.size:
+            self._play_pos = 0
+        import sounddevice as sd
+
+        stream = sd.OutputStream(
+            samplerate=self._play_sr,
+            channels=1,
+            blocksize=512,
+            dtype="float32",
+            callback=self._play_callback,
+            finished_callback=self._play_on_finished,
+        )
+        self._play_stream = stream
+        stream.start()
+        self.btn_play.setText("⏸ 暂停")
+        self.btn_stop.setEnabled(True)
+
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_update_ui)
+        self._play_timer.start(100)
+
+    def _play_stop(self) -> None:
+        self._pause_stream()
+        self._play_pos = 0
+        self.wave.hide_playback_cursor()
+        if self._play_samples is not None:
+            self.play_slider.setValue(0)
+            self.lbl_time.setText(f"00:00 / {self._fmt_t(self._play_samples.size / self._play_sr)}")
+
+    def _play_seek(self, slider_pos: int) -> None:
+        if self._play_samples is None:
+            return
+        t = slider_pos / 1000.0
+        self._play_pos = int(t * self._play_sr)
+        self.wave.set_playback_position(t)
+        self.lbl_time.setText(
+            f"{self._fmt_t(t)} / {self._fmt_t(self._play_samples.size / self._play_sr)}"
+        )
+
+    def _pause_stream(self) -> None:
+        if self._play_stream is not None and self._play_stream.active:
+            try:
+                self._play_stream.stop()
+            except Exception:
+                pass
+        self._play_stream = None
+        if self._play_timer is not None:
+            self._play_timer.stop()
+            self._play_timer = None
+        self.btn_play.setText("▶ 播放")
+        self.btn_stop.setEnabled(False)
+
+    def _play_callback(self, outdata: np.ndarray, frames: int, time_info, status) -> None:
+        if self._play_samples is None:
+            outdata.fill(0)
+            return
+        with self._play_lock:
+            pos = self._play_pos
+            end = min(pos + frames, self._play_samples.size)
+            chunk_size = end - pos
+            vol = max(0.0, min(1.0, self.vol_slider.value() / 100.0))
+            if chunk_size > 0:
+                chunk = self._play_samples[pos:end]
+                # apply volume
+                if vol != 1.0:
+                    chunk = chunk * vol
+                outdata[:chunk_size, 0] = chunk
+                outdata[chunk_size:, 0] = 0.0
+                self._play_pos = end
+            else:
+                outdata.fill(0)
+
+    def _play_on_finished(self) -> None:
+        # called from the audio thread; just schedule UI update via Qt event loop
+        pass
+
+    def _play_update_ui(self) -> None:
+        if self._play_samples is None:
+            return
+        with self._play_lock:
+            pos = self._play_pos
+        t = pos / self._play_sr
+        dur = self._play_samples.size / self._play_sr
+        self.play_slider.blockSignals(True)
+        self.play_slider.setValue(int(t * 1000))
+        self.play_slider.blockSignals(False)
+        self.lbl_time.setText(f"{self._fmt_t(t)} / {self._fmt_t(dur)}")
+        self.wave.set_playback_position(t)
+        if pos >= self._play_samples.size:
+            self._pause_stream()
+            self._play_pos = 0
+            self.wave.hide_playback_cursor()
 
     # ------------------------------------------------------------------ #
     # clips table population / interaction
@@ -473,8 +648,11 @@ class MainWindow(QMainWindow):
         try:
             samples = load_wav(self.files.resolve(clip.audio_path), config.SAMPLE_RATE)
             self.wave.set_samples(samples, config.SAMPLE_RATE)
+            self._set_play_samples(samples, config.SAMPLE_RATE)
         except Exception:
             self.wave.clear()
+            self._set_play_samples(None)
+            samples = None
         from src.asr.recognizer import VoskRecognizer
         from src.asr.keyword import KeywordSpotter
         try:
@@ -688,6 +866,7 @@ class MainWindow(QMainWindow):
         if self._worker_thread and self._worker_thread.isRunning():
             self._worker_thread.quit()
             self._worker_thread.wait(3000)
+        self._pause_stream()
         event.accept()
 
 
