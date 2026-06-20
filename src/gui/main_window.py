@@ -1,0 +1,564 @@
+"""Main application window (PySide6).
+
+Layout
+------
+* toolbar  : record / stop / import / export / denoiser backend / ASR toggle
+* left     : search + clips table (drop a tag onto a row to re-tag it)
+* center   : waveform + emotion / feature / transcript read-outs
+* right    : draggable tag palette + milestone log
+
+Recording is captured on the sounddevice thread; a 30 ms QTimer polls the
+recorder buffer for the live waveform.  Heavy work (features + ASR + DB)
+runs on a QThread so the UI never stalls.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+
+import config
+from src.audio.recorder import AudioRecorder, load_wav
+from src.audio.denoiser import Denoiser
+from src.gui.waveform_widget import WaveformWidget
+from src.pipeline import ClipProcessor, ProcessOutcome
+from src.storage.database import Database
+from src.storage.exporter import export_clips
+from src.storage.file_manager import FileManager, sanitize_tag
+from src.emotion.analyzer import EmotionAnalyzer
+
+TAG_MIME = "application/x-bvm-tag"
+_EMOTION_COLORS = {
+    "crying": "#f72585", "laughing": "#ffd60a", "babbling": "#4cc9f0",
+    "talking": "#06d6a0", "neutral": "#8d99ae",
+}
+_EMOTION_ZH = {
+    "crying": "哭泣", "laughing": "大笑", "babbling": "咿呀学语",
+    "talking": "说话", "neutral": "安静",
+}
+
+
+# --------------------------------------------------------------------------- #
+# processing worker
+# --------------------------------------------------------------------------- #
+from PySide6.QtCore import Qt, QThread, Signal, QObject  # noqa: E402
+
+
+class ProcessWorker(QObject):
+    finished = Signal(object)   # ProcessOutcome or Exception
+
+    def __init__(self, processor: ClipProcessor, samples: np.ndarray,
+                 tag: str, run_asr: bool):
+        super().__init__()
+        self.processor = processor
+        self.samples = samples
+        self.tag = tag
+        self.run_asr = run_asr
+
+    def run(self) -> None:
+        try:
+            outcome = self.processor.process(
+                self.samples, datetime.now(), self.tag, run_asr=self.run_asr
+            )
+            self.finished.emit(outcome)
+        except Exception as exc:  # noqa: BLE001
+            self.finished.emit(exc)
+
+
+# --------------------------------------------------------------------------- #
+# clips table with tag drag-drop
+# --------------------------------------------------------------------------- #
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget, QWidgetAction,
+)
+
+
+class ClipsTable(QTableWidget):
+    """Table whose rows accept dropped tags to re-tag a clip."""
+
+    def __init__(self, on_drop_tag):
+        super().__init__(0, 7)
+        self.on_drop_tag = on_drop_tag
+        self.setHorizontalHeaderLabels(
+            ["日期", "标签", "情绪", "时长(s)", "F0(Hz)", "转写", "里程碑"]
+        )
+        self.verticalHeader().setVisible(False)
+        self.setAcceptDrops(True)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setEditTriggers(QAbstractItemView.DoubleClicked
+                             | QAbstractItemView.EditKeyPressed)
+        self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.horizontalHeader().setStretchLastSection(True)
+
+    # -- drag & drop ----------------------------------------------------- #
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(TAG_MIME) or event.mimeData().hasText():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(TAG_MIME) or event.mimeData().hasText():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(TAG_MIME):
+            tag = bytes(mime.data(TAG_MIME)).decode("utf-8")
+        elif mime.hasText():
+            tag = mime.text()
+        else:
+            event.ignore()
+            return
+        row = self.indexAt(event.position().toPoint() if hasattr(event, "position") else event.pos()).row()
+        if row < 0:
+            event.ignore()
+            return
+        clip_id_item = self.item(row, 0)
+        clip_id = clip_id_item.data(Qt.UserRole) if clip_id_item else None
+        if clip_id is not None:
+            self.on_drop_tag(clip_id, tag)
+        event.acceptProposedAction()
+
+    # -- inline tag rename ---------------------------------------------- #
+    def commit_tag_edit(self, row: int, new_text: str) -> None:
+        clip_id = self.item(row, 0).data(Qt.UserRole)
+        self.on_drop_tag(clip_id, new_text)
+
+
+# --------------------------------------------------------------------------- #
+# tag palette (drag source)
+# --------------------------------------------------------------------------- #
+class TagPalette(QListWidget):
+    def __init__(self, tags):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setDefaultDropAction(Qt.CopyAction)
+        for t in tags:
+            self.add_tag(t)
+
+    def add_tag(self, text: str) -> None:
+        item = QListWidgetItem(text)
+        item.setData(Qt.UserRole, text)
+        self.addItem(item)
+
+    def startDrag(self, supportedActions):
+        from PySide6.QtCore import QMimeData, QByteArray
+        from PySide6.QtGui import QDrag
+
+        item = self.currentItem()
+        if item is None:
+            return
+        tag = item.data(Qt.UserRole)
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(TAG_MIME, QByteArray(tag.encode("utf-8")))
+        mime.setText(tag)
+        drag.setMimeData(mime)
+        drag.exec_(Qt.CopyAction)
+
+
+# --------------------------------------------------------------------------- #
+# main window
+# --------------------------------------------------------------------------- #
+class MainWindow(QMainWindow):
+    def __init__(self, db: Database, files: FileManager, processor: ClipProcessor):
+        super().__init__()
+        self.db = db
+        self.files = files
+        self.processor = processor
+        self.recorder: Optional[AudioRecorder] = None
+        self.denoiser = Denoiser(backend="auto")
+        self._worker_thread: Optional[QThread] = None
+        self._worker: Optional[ProcessWorker] = None
+        self._run_asr = processor.asr_available()
+
+        self.setWindowTitle("BabyVoice Museum — 婴儿声音成长档案")
+        self.resize(1280, 820)
+
+        self._build_toolbar()
+        self._build_central()
+        self._build_status()
+        self._refresh_clips()
+        self._refresh_milestones()
+
+    # ------------------------------------------------------------------ #
+    # construction
+    # ------------------------------------------------------------------ #
+    def _build_toolbar(self) -> None:
+        tb = self.addToolBar("主工具栏")
+        tb.setMovable(False)
+
+        self.act_record = QPushButton("● 开始录音")
+        self.act_record.clicked.connect(self.toggle_recording)
+        tb.addWidget(self.act_record)
+
+        act_import = QPushButton("导入 WAV")
+        act_import.clicked.connect(self.import_wav)
+        tb.addWidget(act_import)
+
+        act_export_sel = QPushButton("导出选中")
+        act_export_sel.clicked.connect(lambda: self.export(selected=True))
+        tb.addWidget(act_export_sel)
+
+        act_export_all = QPushButton("导出全部")
+        act_export_all.clicked.connect(lambda: self.export(selected=False))
+        tb.addWidget(act_export_all)
+
+        tb.addSeparator()
+        from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel as QL
+        self.cb_asr = QCheckBox("启用语音识别")
+        self.cb_asr.setChecked(self._run_asr)
+        self.cb_asr.toggled.connect(self._on_asr_toggle)
+        tb.addWidget(self.cb_asr)
+
+        tb.addWidget(QL("  降噪后端:"))
+        self.cb_denoise = QComboBox()
+        self.cb_denoise.addItems(Denoiser.available_backends())
+        self.cb_denoise.setCurrentText(self.denoiser.backend_name)
+        self.cb_denoise.currentTextChanged.connect(self._on_denoise_backend)
+        tb.addWidget(self.cb_denoise)
+
+        tb.addSeparator()
+        info = QLabel(f"  音频: {config.SAMPLE_RATE}Hz | F0 {config.F0_FMIN}-{config.F0_FMAX}Hz | HF保护>{int(config.HF_PROTECT_HZ)}Hz")
+        tb.addWidget(info)
+
+    def _build_central(self) -> None:
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ---- left: search + clips table ----
+        left = QWidget()
+        llay = QVBoxLayout(left)
+        from PySide6.QtWidgets import QLineEdit, QPushButton
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索标签/关键词…")
+        self.search.textChanged.connect(self._refresh_clips)
+        llay.addWidget(self.search)
+        filter_row = QHBoxLayout()
+        self.btn_milestone_only = QPushButton("仅看里程碑")
+        self.btn_milestone_only.setCheckable(True)
+        self.btn_milestone_only.toggled.connect(self._refresh_clips)
+        filter_row.addWidget(self.btn_milestone_only)
+        filter_row.addStretch(1)
+        llay.addLayout(filter_row)
+        self.table = ClipsTable(self._apply_tag_to_clip)
+        self.table.itemSelectionChanged.connect(self._on_clip_selected)
+        llay.addWidget(self.table)
+        splitter.addWidget(left)
+
+        # ---- center: waveform + panels ----
+        center = QWidget()
+        clay = QVBoxLayout(center)
+        self.wave = WaveformWidget()
+        clay.addWidget(self.wave.widget(), 3)
+        self.lbl_emotion = QLabel("情绪: —")
+        self.lbl_emotion.setStyleSheet("font-size:15pt;font-weight:bold;")
+        self.lbl_features = QLabel("特征: —")
+        self.lbl_transcript = QLabel("转写: —")
+        self.lbl_transcript.setWordWrap(True)
+        self.lbl_keywords = QLabel("关键词时间戳: —")
+        self.lbl_keywords.setWordWrap(True)
+        for w in (self.lbl_emotion, self.lbl_features, self.lbl_transcript, self.lbl_keywords):
+            clay.addWidget(w)
+        clay.addStretch(1)
+        splitter.addWidget(center)
+
+        # ---- right: tag palette + milestones ----
+        right = QWidget()
+        rlay = QVBoxLayout(right)
+        rlay.addWidget(QLabel("标签面板 (拖到左侧行可改标签)"))
+        self.palette = TagPalette(list(config.TARGET_WORDS) + ["哭泣", "大笑", "咿呀", "说话", "未标记"])
+        rlay.addWidget(self.palette)
+        from PySide6.QtWidgets import QPushButton
+        btn_add_tag = QPushButton("+ 新建标签")
+        btn_add_tag.clicked.connect(self._add_custom_tag)
+        rlay.addWidget(btn_add_tag)
+        rlay.addWidget(QLabel("里程碑记录"))
+        self.milestones = QListWidget()
+        rlay.addWidget(self.milestones, 1)
+        splitter.addWidget(right)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 2)
+        self.setCentralWidget(splitter)
+
+    def _build_status(self) -> None:
+        self.status = self.statusBar()
+        self.status.showMessage("就绪。按“开始录音”或导入 WAV。")
+
+    # ------------------------------------------------------------------ #
+    # recording
+    # ------------------------------------------------------------------ #
+    def toggle_recording(self) -> None:
+        if self.recorder and self.recorder.running:
+            self._stop_recording()
+            self.act_record.setText("● 开始录音")
+        else:
+            self._start_recording()
+            self.act_record.setText("■ 停止录音")
+
+    def _start_recording(self) -> None:
+        self.denoiser = Denoiser(backend=self.cb_denoise.currentText() or "auto")
+        self.recorder = AudioRecorder(denoiser=self.denoiser, on_block=self._on_live_block)
+        self.recorder.start()
+        self.status.showMessage("录音中… (实时降噪 + HF 保护)")
+        from PySide6.QtCore import QTimer
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._refresh_live_wave)
+        self._live_timer.start(60)
+
+    def _stop_recording(self) -> None:
+        if self._live_timer:
+            self._live_timer.stop()
+            self._live_timer = None
+        samples = self.recorder.stop()
+        self.status.showMessage(f"录音结束 ({len(samples)/config.SAMPLE_RATE:.1f}s)，处理中…")
+        self._process(samples, tag=config.SAFE_TAG_DEFAULT)
+
+    def _on_live_block(self, block: np.ndarray) -> None:
+        # cheap: only store latest for the timer to draw
+        self._latest_block = block
+
+    def _refresh_live_wave(self) -> None:
+        if self.recorder:
+            self.wave.set_samples(self.recorder.get_buffer(), config.SAMPLE_RATE)
+
+    # ------------------------------------------------------------------ #
+    # import / processing
+    # ------------------------------------------------------------------ #
+    def import_wav(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择音频", str(config.DATA_ROOT), "音频 (*.wav *.mp3 *.flac)"
+        )
+        if not path:
+            return
+        try:
+            samples = load_wav(path, config.SAMPLE_RATE)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        self.wave.set_samples(samples, config.SAMPLE_RATE)
+        self.status.showMessage(f"已导入 {path}，处理中…")
+        self._process(samples, tag=config.SAFE_TAG_DEFAULT)
+
+    def _process(self, samples: np.ndarray, tag: str) -> None:
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            QMessageBox.information(self, "忙", "上一次处理尚未完成，请稍候。")
+            return
+        self._worker = ProcessWorker(self.processor, samples, tag, self.cb_asr.isChecked())
+        self._worker_thread = QThread()
+        self._worker.moveToThread(self._worker_thread)
+        self._worker.finished.connect(self._on_process_done)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker_thread.start()
+
+    def _on_process_done(self, outcome) -> None:
+        if self._worker_thread:
+            self._worker_thread.quit()
+            self._worker_thread = None
+            self._worker = None
+        if isinstance(outcome, Exception):
+            QMessageBox.critical(self, "处理失败", str(outcome))
+            self.status.showMessage("处理失败。")
+            return
+        self._show_outcome(outcome)
+        self._refresh_clips()
+        self._refresh_milestones()
+        self.status.showMessage(
+            f"已归档: {outcome.clip.tag} | {outcome.emotion.label} | 里程碑 +{len(outcome.milestones)}"
+        )
+
+    def _show_outcome(self, o: ProcessOutcome) -> None:
+        from src.audio.recorder import load_wav
+        try:
+            samples = load_wav(self.files.resolve(o.clip.audio_path), config.SAMPLE_RATE)
+            self.wave.set_samples(samples, config.SAMPLE_RATE)
+        except Exception:
+            self.wave.set_samples(np.zeros(0, dtype=np.float32), config.SAMPLE_RATE)
+        self.wave.set_keywords(o.keywords)
+        self.wave.set_milestones([m.timestamp for m in o.milestones])
+        f = o.features
+        self.lbl_emotion.setText(
+            f"情绪: {_EMOTION_ZH.get(o.emotion.label, o.emotion.label)} "
+            f"({o.emotion.confidence*100:.0f}%)"
+        )
+        self.lbl_emotion.setStyleSheet(
+            f"font-size:15pt;font-weight:bold;color:{_EMOTION_COLORS.get(o.emotion.label,'#fff')};"
+        )
+        self.lbl_features.setText(
+            f"特征: F0均值 {f.f0_mean:.0f}Hz (σ {f.f0_std:.0f}) | "
+            f"能量 {f.energy_mean_db:.1f}dB | 浊音率 {f.voiced_ratio*100:.0f}% | "
+            f"笑调节奏 {f.laugh_modulation:.2f} | 时长 {f.duration:.1f}s"
+        )
+        self.lbl_transcript.setText(f"转写: {o.clip.transcript or '(无)'}")
+        if o.keywords:
+            ks = "  ".join(f"{h.word}@{h.start:.2f}-{h.end:.2f}s" for h in o.keywords)
+            self.lbl_keywords.setText(f"关键词时间戳: {ks}")
+        else:
+            self.lbl_keywords.setText("关键词时间戳: (无)")
+
+    # ------------------------------------------------------------------ #
+    # clips table population / interaction
+    # ------------------------------------------------------------------ #
+    def _refresh_clips(self) -> None:
+        text = self.search.text().strip()
+        milestone_only = self.btn_milestone_only.isChecked()
+        if text or milestone_only:
+            clips = self.db.search_clips(
+                keyword=text or None, milestone_only=milestone_only
+            )
+        else:
+            clips = self.db.list_clips(limit=1000)
+        self.table.setRowCount(0)
+        for c in clips:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            date_item = QTableWidgetItem(c.recorded_at.strftime("%Y-%m-%d %H:%M"))
+            date_item.setData(Qt.UserRole, c.id)
+            tag_item = QTableWidgetItem(c.tag)
+            emo_item = QTableWidgetItem(_EMOTION_ZH.get(c.emotion, c.emotion))
+            emo_item.setForeground(_qcolor(_EMOTION_COLORS.get(c.emotion, "#cccccc")))
+            dur_item = QTableWidgetItem(f"{c.duration_s:.1f}")
+            f0_item = QTableWidgetItem(f"{c.f0_mean:.0f}")
+            tr_item = QTableWidgetItem(c.transcript[:30] + ("…" if len(c.transcript) > 30 else ""))
+            ms_item = QTableWidgetItem("★" if c.is_milestone else "")
+            ms_item.setTextAlignment(Qt.AlignCenter)
+            for col, it in enumerate(
+                [date_item, tag_item, emo_item, dur_item, f0_item, tr_item, ms_item]
+            ):
+                it.setFlags(it.flags() | Qt.ItemIsEditable if col == 1 else it.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(r, col, it)
+
+    def _on_clip_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        clip_id = self.table.item(row, 0).data(Qt.UserRole)
+        clip = self.db.get_clip(clip_id)
+        if not clip:
+            return
+        from src.audio.recorder import load_wav
+        try:
+            samples = load_wav(self.files.resolve(clip.audio_path), config.SAMPLE_RATE)
+            self.wave.set_samples(samples, config.SAMPLE_RATE)
+        except Exception:
+            self.wave.clear()
+        from src.asr.recognizer import VoskRecognizer
+        from src.asr.keyword import KeywordSpotter
+        try:
+            asr = VoskRecognizer().transcribe(samples)
+            hits = KeywordSpotter().find(asr)
+        except Exception:
+            asr = None
+            hits = []
+        self.wave.set_keywords(hits)
+        ms = [m for m in self.db.list_milestones() if m.clip_id == clip_id]
+        self.wave.set_milestones([m.timestamp for m in ms])
+        self.lbl_emotion.setText(
+            f"情绪: {_EMOTION_ZH.get(clip.emotion, clip.emotion)} "
+            f"({clip.emotion_confidence*100:.0f}%)"
+        )
+        self.lbl_emotion.setStyleSheet(
+            f"font-size:15pt;font-weight:bold;color:{_EMOTION_COLORS.get(clip.emotion,'#fff')};"
+        )
+        self.lbl_features.setText(
+            f"特征: F0均值 {clip.f0_mean:.0f}Hz | 能量 {clip.energy_db:.1f}dB | "
+            f"时长 {clip.duration_s:.1f}s | 标签 {', '.join(clip.tags) or '-'}"
+        )
+        self.lbl_transcript.setText(f"转写: {clip.transcript or '(无)'}")
+        ks = "  ".join(f"{h.word}@{h.start:.2f}s" for h in hits)
+        self.lbl_keywords.setText(f"关键词时间戳: {ks or '(无)'}")
+
+    def _apply_tag_to_clip(self, clip_id: int, new_tag: str) -> None:
+        clip = self.db.get_clip(clip_id)
+        if not clip:
+            return
+        new_tag = sanitize_tag(new_tag)
+        if new_tag == clip.tag:
+            return
+        self.processor.re_tag(clip, new_tag)
+        self.status.showMessage(f"已将片段 #{clip_id} 重命名为 “{new_tag}”")
+        self._refresh_clips()
+
+    # ------------------------------------------------------------------ #
+    # export
+    # ------------------------------------------------------------------ #
+    def export(self, selected: bool) -> None:
+        if selected:
+            row = self.table.currentRow()
+            if row < 0:
+                QMessageBox.information(self, "导出", "请先在左侧选中一个片段。")
+                return
+            clip_id = self.table.item(row, 0).data(Qt.UserRole)
+            clips = [self.db.get_clip(clip_id)]
+        else:
+            clips = self.db.list_clips(limit=100000)
+        if not clips:
+            QMessageBox.information(self, "导出", "没有可导出的片段。")
+            return
+        dest = QFileDialog.getExistingDirectory(self, "选择导出目录", str(config.EXPORT_ROOT))
+        if not dest:
+            return
+        from pathlib import Path
+        out = export_clips(clips, self.db, Path(dest))
+        QMessageBox.information(self, "导出完成", f"已导出 {len(clips)} 个片段到:\n{out}")
+
+    # ------------------------------------------------------------------ #
+    # milestones / palette
+    # ------------------------------------------------------------------ #
+    def _refresh_milestones(self) -> None:
+        self.milestones.clear()
+        for m in self.db.list_milestones():
+            clip = self.db.get_clip(m.clip_id)
+            when = clip.recorded_at.strftime("%Y-%m-%d %H:%M") if clip else "?"
+            self.milestones.addItem(f"★ {m.word}  @ {when}  ({m.timestamp:.1f}s)")
+
+    def _add_custom_tag(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, "新建标签", "标签名称:")
+        if ok and text.strip():
+            self.palette.add_tag(sanitize_tag(text))
+
+    # ------------------------------------------------------------------ #
+    # toolbar handlers
+    # ------------------------------------------------------------------ #
+    def _on_asr_toggle(self, on: bool) -> None:
+        if on and not self.processor.asr_available():
+            QMessageBox.warning(
+                self, "语音识别不可用",
+                f"未找到 Vosk 中文模型: {config.VOSK_MODEL_PATH}\n"
+                "请下载 vosk-model-small-cn-0.22 并解压到该目录后重试。",
+            )
+            self.cb_asr.blockSignals(True)
+            self.cb_asr.setChecked(False)
+            self.cb_asr.blockSignals(False)
+            return
+        self._run_asr = on
+
+    def _on_denoise_backend(self, name: str) -> None:
+        try:
+            self.denoiser = Denoiser(backend=name)
+            self.status.showMessage(f"降噪后端: {self.denoiser.backend_name}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "降噪后端", str(exc))
+
+    # ------------------------------------------------------------------ #
+    def closeEvent(self, event):
+        if self.recorder and self.recorder.running:
+            self.recorder.stop()
+        if self._worker_thread and self._worker_thread.isRunning():
+            self._worker_thread.quit()
+            self._worker_thread.wait(3000)
+        event.accept()
+
+
+def _qcolor(hexstr: str):
+    from PySide6.QtGui import QColor
+    return QColor(hexstr)
