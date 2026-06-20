@@ -555,17 +555,124 @@ class MainWindow(QMainWindow):
     # toolbar handlers
     # ------------------------------------------------------------------ #
     def _on_asr_toggle(self, on: bool) -> None:
-        if on and not self.processor.asr_available():
-            QMessageBox.warning(
-                self, "语音识别不可用",
-                f"未找到 Vosk 中文模型: {config.VOSK_MODEL_PATH}\n"
-                "请下载 vosk-model-small-cn-0.22 并解压到该目录后重试。",
-            )
-            self.cb_asr.blockSignals(True)
-            self.cb_asr.setChecked(False)
-            self.cb_asr.blockSignals(False)
+        if not on:
+            self._run_asr = False
             return
-        self._run_asr = on
+        if self.processor.asr_available():
+            self._run_asr = True
+            return
+        # Not available -> prompt user with download links + one-click option
+        self._prompt_download_model_and_enable()
+        self.cb_asr.blockSignals(True)
+        self.cb_asr.setChecked(bool(self._run_asr))
+        self.cb_asr.blockSignals(False)
+
+    def _prompt_download_model_and_enable(self) -> None:
+        from PySide6.QtWidgets import QProgressDialog
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        from src.asr.recognizer import VoskModelMissingError
+
+        err = VoskModelMissingError(config.VOSK_MODEL_PATH)
+        mb = QMessageBox(self)
+        mb.setIcon(QMessageBox.Warning)
+        mb.setWindowTitle("启用语音识别缺少模型")
+        mb.setTextFormat(Qt.RichText)
+        mb.setText(
+            f"<p><b>未找到 Vosk 中文离线识别模型。</b></p>"
+            f"<p>期望路径：<br><code>{config.VOSK_MODEL_PATH}</code></p>"
+            f"<p>可选项：</p>"
+            f"<ol>"
+            f"  <li>点击下方 “<b>一键自动下载</b>” 按钮（推荐，官方源约 40 MB）。</li>"
+            f"  <li>手动下载并解压：</li>"
+            f"    <ul style='list-style:none'>"
+            f"      <li>· <a href='{config.VOSK_MODEL_DOWNLOAD_URLS[0]}'>alphacephei.com 官方镜像</a></li>"
+            f"      <li>· <a href='{config.VOSK_MODEL_DOWNLOAD_URLS[1]}'>GitHub Releases 镜像</a></li>"
+            f"      <li>· 全部模型：<a href='{config.VOSK_MODEL_HOME_URL}'>{config.VOSK_MODEL_HOME_URL}</a></li>"
+            f"    </ul>"
+            f"    解压后放入：<code>{config.VOSK_MODEL_PATH.parent}</code></ol>"
+        )
+        mb.setTextInteractionFlags(Qt.TextBrowserInteraction | Qt.LinksAccessibleByMouse)
+        auto_btn = mb.addButton("一键自动下载", QMessageBox.AcceptRole)
+        open_dir_btn = mb.addButton("打开目标文件夹", QMessageBox.ActionRole)
+        home_btn = mb.addButton("在浏览器打开下载页", QMessageBox.ActionRole)
+        cancel_btn = mb.addButton("取消", QMessageBox.RejectRole)
+        mb.exec()
+        clicked = mb.clickedButton()
+
+        if clicked is open_dir_btn:
+            from pathlib import Path
+            import os
+            Path(config.VOSK_MODEL_PATH).parent.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(Path(config.VOSK_MODEL_PATH).parent))  # type: ignore[attr-defined]
+            return
+        if clicked is home_btn:
+            QDesktopServices.openUrl(QUrl(config.VOSK_MODEL_HOME_URL))
+            return
+        if clicked is not auto_btn:
+            self._run_asr = False
+            return
+
+        # ---- run the download in a background thread with progress ----
+        prog = QProgressDialog("正在下载 Vosk 中文模型…", "取消", 0, 100, self)
+        prog.setWindowTitle("下载离线语音识别模型")
+        prog.setMinimumDuration(0)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setAutoReset(False)
+        prog.setAutoClose(False)
+        prog.setValue(0)
+
+        worker = ModelDownloadWorker(force=False)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.failed.connect(lambda msg: (
+            prog.cancel(),
+            QMessageBox.critical(self, "下载失败", msg),
+        ))
+
+        def _on_progress(done: int, total: int) -> None:
+            if prog.wasCanceled():
+                return
+            if total > 0:
+                pct = int(done * 100 / total)
+                prog.setMaximum(100)
+                prog.setValue(pct)
+                prog.setLabelText(
+                    f"下载中 {done/1024/1024:.1f} / {total/1024/1024:.1f} MB ({pct}%)"
+                )
+            else:
+                prog.setMaximum(0)  # busy
+                prog.setLabelText(f"下载中 {done/1024/1024:.1f} MB …")
+
+        worker.progress.connect(_on_progress)
+
+        def _on_ok(path) -> None:
+            prog.reset()
+            prog.close()
+            self.status.showMessage(f"模型下载完成: {path}")
+            self._run_asr = True
+            self.cb_asr.blockSignals(True)
+            self.cb_asr.setChecked(True)
+            self.cb_asr.blockSignals(False)
+            QMessageBox.information(
+                self, "下载完成",
+                f"Vosk 中文模型已就绪：\n{path}\n现在可以使用语音识别了。",
+            )
+
+        worker.finished_ok.connect(_on_ok)
+        # thread lifecycle cleanup
+        def _cleanup():
+            thread.quit()
+            thread.wait(2000)
+        worker.finished_ok.connect(_cleanup)
+        worker.failed.connect(_cleanup)
+        prog.canceled.connect(lambda: (
+            _cleanup(),
+            setattr(self, '_run_asr', False),
+        ))
+        thread.start()
 
     def _on_denoise_backend(self, name: str) -> None:
         try:

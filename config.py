@@ -25,11 +25,11 @@ VOSK_MODEL_PATH = Path(os.environ.get(
     DATA_ROOT / "models" / VOSK_MODEL_NAME,
 ))
 
-# Vosk model download URLs.
-# * Official "vosk-model-small-cn-0.22" (~40 MB, 4-gram, Chinese, offline)
+# Vosk model download URLs (in priority order; fall back on failure).
+# NOTE: Only verified-valid URLs are listed here.  More mirrors can be found
+# at VOSK_MODEL_HOME_URL (the official Vosk models page).
 VOSK_MODEL_DOWNLOAD_URLS: list[str] = [
     "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip",
-    "https://github.com/alphacep/vosk-space/releases/download/v0.22/vosk-model-small-cn-0.22.zip",
 ]
 VOSK_MODEL_HOME_URL = "https://alphacephei.com/vosk/models"
 
