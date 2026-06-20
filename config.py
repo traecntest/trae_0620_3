@@ -19,10 +19,19 @@ EXPORT_ROOT = DATA_ROOT / "exports"
 
 # Vosk model directory (offline Chinese model).  The user downloads
 # `vosk-model-small-cn-0.22` (or a larger one) and extracts it here.
+VOSK_MODEL_NAME = os.environ.get("BVM_VOSK_MODEL_NAME", "vosk-model-small-cn-0.22")
 VOSK_MODEL_PATH = Path(os.environ.get(
     "BVM_VOSK_MODEL",
-    DATA_ROOT / "models" / "vosk-model-small-cn-0.22",
+    DATA_ROOT / "models" / VOSK_MODEL_NAME,
 ))
+
+# Vosk model download URLs.
+# * Official "vosk-model-small-cn-0.22" (~40 MB, 4-gram, Chinese, offline)
+VOSK_MODEL_DOWNLOAD_URLS: list[str] = [
+    "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip",
+    "https://github.com/alphacep/vosk-space/releases/download/v0.22/vosk-model-small-cn-0.22.zip",
+]
+VOSK_MODEL_HOME_URL = "https://alphacephei.com/vosk/models"
 
 for _p in (DATA_ROOT, AUDIO_ROOT, EXPORT_ROOT):
     _p.mkdir(parents=True, exist_ok=True)

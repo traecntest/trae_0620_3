@@ -67,6 +67,31 @@ class ProcessWorker(QObject):
 
 
 # --------------------------------------------------------------------------- #
+# model download worker (background thread so GUI stays alive)
+# --------------------------------------------------------------------------- #
+class ModelDownloadWorker(QObject):
+    progress = Signal(int, int)     # downloaded, total (total=-1 when unknown)
+    finished_ok = Signal(object)    # resulting Path
+    failed = Signal(str)
+
+    def __init__(self, force: bool = False):
+        super().__init__()
+        self.force = force
+
+    def run(self) -> None:
+        from src.asr.recognizer import ensure_vosk_model
+        try:
+            path = ensure_vosk_model(
+                force=self.force,
+                progress_cb=lambda done, total: self.progress.emit(int(done), int(total)),
+                timeout_s=120,
+            )
+            self.finished_ok.emit(path)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- #
 # clips table with tag drag-drop
 # --------------------------------------------------------------------------- #
 from PySide6.QtWidgets import (  # noqa: E402

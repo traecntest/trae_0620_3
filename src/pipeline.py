@@ -64,11 +64,7 @@ class ClipProcessor:
         return self._recognizer
 
     def asr_available(self) -> bool:
-        try:
-            _ = self.recognizer  # noqa: F841
-            return True
-        except Exception:
-            return False
+        return VoskRecognizer.is_available()
 
     # ------------------------------------------------------------------ #
     def process(
