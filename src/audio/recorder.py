@@ -93,8 +93,11 @@ class AudioRecorder:
     # sounddevice callback
     # ------------------------------------------------------------------ #
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        block = indata[:, 0].copy() if self.channels > 1 else indata.copy()
-        block = block.astype(np.float32, copy=False)
+        # sounddevice always returns shape (frames, channels) even for mono,
+        # so we reshape explicitly and take channel 0 to guarantee a flat 1D
+        # array that concatenates cleanly with the buffer.
+        block = np.asarray(indata, dtype=np.float32).reshape(-1, self.channels)[:, 0]
+        block = np.ascontiguousarray(block, dtype=np.float32)
         try:
             clean = self.denoiser.denoise_block(block)
         except Exception:
